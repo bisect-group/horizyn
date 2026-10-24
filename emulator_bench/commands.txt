@@ -1,0 +1,31 @@
+# Run every command from the submodule root: <EMULaToR>/baselines/Horizon
+# Outputs go to <EMULaToR>/outputs/baselines/Horizon (set --out_root to change).
+PY=/home/adhil/.conda/envs/horizyn_venv/bin/python
+# horizyn_venv is a venv on top of mldb with h5py added. mldb itself has no h5py.
+
+# 1. Show the splits found on disk and the runs still to do (nothing is written)
+$PY -m emulator_bench.run_benchmarks --dry_run
+
+# 2. All default splits x seeds 666 777 888 on GPUs 0 1 2 (two runs per GPU, about 6.5 GB each)
+#    Step 1 builds ProtT5 vectors (one shard per GPU), fingerprints and pair files once per split. Step 2 trains and evaluates.
+$PY -m emulator_bench.run_benchmarks --gpus 0 1 2 --runs_per_gpu 2
+# bf16 autocast on Ampere or newer (fp16 on older GPUs). Default is fp32, the original precision.
+$PY -m emulator_bench.run_benchmarks --gpus 0 1 2 --runs_per_gpu 2 --amp
+
+# 3. Build the inputs only (ProtT5 embedding is the slow part)
+$PY -m emulator_bench.run_benchmarks --gpus 0 --features_only
+
+# Features only, three splits (Random, Time, DRFP), on GPU 2
+$PY -m emulator_bench.run_benchmarks --gpus 2 --features_only \
+  --splits random_splits_grouped_rxn_key uniprot_time_splits reaction_drfp_tanimoto_splits
+
+# 4. One split and one seed
+$PY -m emulator_bench.run_benchmarks --gpus 0 --splits with_protein_information/uniprot_time_splits/all --seeds 666
+
+# 5. Summary CSVs from the saved predictions: summary_by_seed.csv, summary.csv, dropped_reactions.csv
+$PY -m emulator_bench.aggregate_results
+
+# Smoke test on CPU (tiny data, random protein vectors, 3 epochs). Use any scratch folder as --out_root.
+CUDA_VISIBLE_DEVICES="" $PY -m emulator_bench.run_benchmarks --out_root /path/to/scratch/smoke \
+  --splits with_protein_information/uniprot_time_splits --seeds 666 --limit_per_split 64 \
+  --embedding_source deterministic --epochs 3 --eval_splits val test

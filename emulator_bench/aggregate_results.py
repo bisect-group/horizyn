@@ -1,157 +1,89 @@
+"""Rebuild the summary CSVs from the saved predictions and results of every run.
+
+Writes <out_root>/enzyme_retrieval/{summary_by_seed,summary,dropped_reactions}.csv. The EC accuracy is recomputed from
+predictions_<split>.csv and checked against results_<split>.json.
+"""
+
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Iterable
 
 import pandas as pd
 
-from .utils import DEFAULT_RUNS_ROOT, ensure_dir, read_json
+from .results import compute_care_task2_metrics
+from .utils import DEFAULT_OUT_ROOT, TASK, read_json
 
 
-METRIC_SECTIONS = ("primary_native_horizon", "care_task2", "supplemental_ec_ranking")
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Aggregate Horizon EMULaToR seed metrics")
-    parser.add_argument("--runs-root", default=str(DEFAULT_RUNS_ROOT))
-    parser.add_argument("--long-csv", default=None)
-    parser.add_argument("--summary-csv", default=None)
-    return parser.parse_args()
-
-
-def iter_metric_files(runs_root: str | Path) -> list[Path]:
-    root = Path(runs_root)
-    return sorted(root.glob("*/seeds/*/results/*/metrics.json"))
-
-
-def flatten_scalar_metrics(data: dict, prefix: str = "") -> Iterable[tuple[str, float]]:
+def flatten(prefix: str, data: dict) -> dict[str, float]:
+    out = {}
     for key, value in data.items():
-        metric_name = f"{prefix}.{key}" if prefix else str(key)
-        if isinstance(value, bool):
-            continue
-        if isinstance(value, (int, float)):
-            yield metric_name, float(value)
-        elif isinstance(value, dict):
-            yield from flatten_scalar_metrics(value, metric_name)
+        if isinstance(value, dict):
+            out.update(flatten(f"{prefix}.{key}", value))
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            out[f"{prefix}.{key}"] = float(value)
+    return out
 
 
-def metric_context(metric_path: Path) -> tuple[str, str, str]:
-    seed = metric_path.parents[2].name
-    split_group = metric_path.parents[4].name
-    eval_split = metric_path.parent.name
-    return split_group, seed, eval_split
-
-
-def collect_metric_rows(runs_root: str | Path) -> list[dict]:
+def collect(task_root: Path, eval_split: str) -> pd.DataFrame:
     rows = []
-    for metric_path in iter_metric_files(runs_root):
-        metrics = read_json(metric_path)
-        path_split_group, path_seed, path_eval_split = metric_context(metric_path)
-        split_group = str(metrics.get("split_group", path_split_group))
-        seed = str(metrics.get("seed", path_seed))
-        eval_split = str(metrics.get("eval_split", path_eval_split))
-        ec_candidate_splits = metrics.get("ec_candidate_splits", [])
-        if isinstance(ec_candidate_splits, list):
-            ec_candidate_splits = ";".join(str(split) for split in ec_candidate_splits)
-        else:
-            ec_candidate_splits = str(ec_candidate_splits)
-        ec_scoring = str(metrics.get("ec_scoring", ""))
-        score_similarity = str(metrics.get("score_similarity", ""))
-        direction_aggregation = str(metrics.get("direction_aggregation", ""))
-        max_rank_columns = str(metrics.get("max_rank_columns", ""))
-        result_name = str(metrics.get("result_name", path_eval_split))
-
-        for section in METRIC_SECTIONS:
-            section_metrics = metrics.get(section)
-            if not isinstance(section_metrics, dict):
-                continue
-            for metric, value in flatten_scalar_metrics(section_metrics, section):
-                rows.append(
-                    {
-                        "split_group": split_group,
-                        "seed": seed,
-                        "eval_split": eval_split,
-                        "result_name": result_name,
-                        "ec_candidate_splits": ec_candidate_splits,
-                        "ec_scoring": ec_scoring,
-                        "score_similarity": score_similarity,
-                        "direction_aggregation": direction_aggregation,
-                        "max_rank_columns": max_rank_columns,
-                        "metric": metric,
-                        "value": value,
-                        "metrics_path": str(metric_path),
-                    }
-                )
-    return rows
-
-
-def write_aggregate_csvs(
-    rows: list[dict],
-    *,
-    long_csv: str | Path,
-    summary_csv: str | Path,
-) -> tuple[Path, Path]:
-    if not rows:
-        raise FileNotFoundError("No seed metric files found under runs-root")
-
-    long_path = Path(long_csv)
-    summary_path = Path(summary_csv)
-    ensure_dir(long_path.parent)
-    ensure_dir(summary_path.parent)
-
-    long_df = pd.DataFrame(rows).sort_values(
-        [
-            "split_group",
-            "eval_split",
-            "result_name",
-            "ec_candidate_splits",
-            "ec_scoring",
-            "score_similarity",
-            "direction_aggregation",
-            "max_rank_columns",
-            "metric",
-            "seed",
+    for result_path in sorted(task_root.glob(f"**/seed_*/results_{eval_split}.json")):
+        run_dir = result_path.parent
+        result = read_json(result_path)
+        predictions = pd.read_csv(run_dir / f"predictions_{eval_split}.csv")
+        recomputed = compute_care_task2_metrics(predictions)
+        if recomputed != result["ec_accuracy"]:
+            raise ValueError(f"{result_path}: EC accuracy does not match the saved predictions")
+        if recomputed["k=1"]["level_1_accuracy"] == 0:
+            print(f"WARNING: all EC accuracies are 0 in {run_dir}. Check this run.")
+        group, name = run_dir.parent.parent.relative_to(task_root).as_posix(), run_dir.parent.name
+        metrics = {**flatten("ec", recomputed), **flatten("native", result["native"])}
+        metrics.pop("native.num_queries", None)
+        rows += [
+            {
+                "split_group": group,
+                "split_name": name,
+                "seed": int(run_dir.name.removeprefix("seed_")),
+                "metric": metric,
+                "value": value,
+            }
+            for metric, value in metrics.items()
         ]
-    )
-    summary_df = (
-        long_df.groupby(
-            [
-                "split_group",
-                "eval_split",
-                "result_name",
-                "ec_candidate_splits",
-                "ec_scoring",
-                "score_similarity",
-                "direction_aggregation",
-                "max_rank_columns",
-                "metric",
-            ]
-        )["value"]
-        .agg(count="count", mean="mean", std="std")
-        .reset_index()
-    )
-    summary_df["std"] = summary_df["std"].fillna(0.0)
-
-    long_df.to_csv(long_path, index=False)
-    summary_df.to_csv(summary_path, index=False)
-    return long_path, summary_path
+    return pd.DataFrame(rows)
 
 
 def main() -> None:
-    args = parse_args()
-    runs_root = Path(args.runs_root)
-    long_csv = args.long_csv or runs_root / "aggregated_seed_metrics_long.csv"
-    summary_csv = args.summary_csv or runs_root / "aggregated_seed_metrics_summary.csv"
-
-    rows = collect_metric_rows(runs_root)
-    long_path, summary_path = write_aggregate_csvs(
-        rows,
-        long_csv=long_csv,
-        summary_csv=summary_csv,
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out_root", default=str(DEFAULT_OUT_ROOT))
+    parser.add_argument("--eval_split", default="test", choices=["val", "test"])
+    args = parser.parse_args()
+    task_root = Path(args.out_root) / TASK
+    by_seed = collect(task_root, args.eval_split)
+    if by_seed.empty:
+        raise SystemExit(f"No results found under {task_root}")
+    keys = ["split_group", "split_name", "metric"]
+    summary = (
+        by_seed.groupby(keys)["value"].agg(n_seeds="count", mean="mean", std="std").reset_index()
     )
-    print(f"[emulator_bench] long metrics: {long_path}", flush=True)
-    print(f"[emulator_bench] summary metrics: {summary_path}", flush=True)
+    by_seed.to_csv(task_root / "summary_by_seed.csv", index=False)
+    summary.to_csv(task_root / "summary.csv", index=False)
+
+    dropped = []
+    for path in sorted(task_root.glob("**/data/data_summary.json")):
+        data = read_json(path)
+        dropped += [
+            {
+                "split": data["split"],
+                "file": f,
+                "reactions": s["reactions"],
+                "dropped_reactions": s["dropped_unfeaturizable_reactions"],
+                "dropped_pairs": s["dropped_unfeaturizable_pairs"],
+                "unique_pairs": s["unique_pairs"],
+            }
+            for f, s in data["stats"].items()
+        ]
+    pd.DataFrame(dropped).to_csv(task_root / "dropped_reactions.csv", index=False)
+    print(f"[emulator_bench] wrote summaries to {task_root}")
 
 
 if __name__ == "__main__":

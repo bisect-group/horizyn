@@ -1,364 +1,466 @@
+"""Build the inputs of one split: ProtT5 vectors, reaction fingerprints, pair CSVs and the protein HDF5 file.
+
+Reaction fingerprints come from the original Horizyn dataset classes. Protein vectors are cached once per
+unique sequence. Both caches live under <out_root>/embeddings/<kind>_v<N>/.
+"""
+
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
+import uuid
+from collections import Counter
 from pathlib import Path
 
 import h5py
 import numpy as np
 import pandas as pd
 import torch
-try:
-    from src.utils.rich_progress import progress, write
-except ModuleNotFoundError:
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
+from tqdm import tqdm
 
-from .dataset_adapter import (
-    DEFAULT_MAX_SEQUENCE_LENGTH,
-    SPLIT_NAMES,
-    prepare_split_group,
-    select_split_groups,
-)
+from .dataset_adapter import SPLIT_NAMES, SplitDir, discover_splits, full_ec_labels, load_records
 from .utils import (
-    DEFAULT_CACHE_ROOT,
     DEFAULT_DATASET_ROOT,
-    DEFAULT_RUNS_ROOT,
-    ensure_dir,
-    metadata_path_for_split,
+    DEFAULT_OUT_ROOT,
+    FP_CACHE,
+    HPARAMS,
+    PROTEIN_CACHE,
+    atomic_write,
     read_json,
-    resolve_path,
+    reaction_id_for_smiles,
     sha256_text,
+    split_dir_of,
     write_json,
 )
 
-
-def protein_cache_path(cache_root: str | Path, protein_id: str) -> Path:
-    shard = protein_id.split("_", 1)[-1][:2]
-    return Path(cache_root) / "proteins" / shard / f"{protein_id}.npy"
-
-
-def deterministic_vector(sequence: str, dim: int) -> np.ndarray:
-    seed = int(sha256_text(sequence)[:16], 16) % (2**32)
-    rng = np.random.default_rng(seed)
-    vec = rng.standard_normal(dim).astype(np.float32)
-    norm = np.linalg.norm(vec)
-    if norm > 0:
-        vec = vec / norm
-    return vec.astype(np.float32)
+RXN = HPARAMS["reaction_features"]
+PROT = HPARAMS["protein_features"]
+STD = {f"standardize_{k}": v for k, v in RXN["standardize"].items() if k != "enabled"}
+FP_DIM = RXN["rdkit_plus"]["vec_dim"]
+SMOKE_CACHE = "smoke_embeddings"
+SHARD_ROWS = 20000
 
 
-def _load_protein_table(metadata: dict) -> pd.DataFrame:
-    frames = []
-    for split in SPLIT_NAMES:
-        frame = pd.read_csv(metadata["manifests"][split])
-        frames.append(frame.loc[:, ["protein_id", "sequence", "sequence_sha256"]])
-    proteins = pd.concat(frames, ignore_index=True).drop_duplicates("protein_id")
+# ---------------------------------------------------------------------------------------------------------
+# Cache folders
+# ---------------------------------------------------------------------------------------------------------
+def cache_dir(out_root: Path, name: str, config: dict) -> Path:
+    """Return the cache folder. The folder keeps its config. A different config needs a new version number."""
+    path = Path(out_root) / "embeddings" / name
+    config_path = path / "config.json"
+    if config_path.exists():
+        if read_json(config_path) != config:
+            raise ValueError(
+                f"{config_path} holds a different config. Bump the cache version in utils.py."
+            )
+    else:
+        write_json(config_path, config)
+    return path
+
+
+def item_path(root: Path, key: str, suffix: str) -> Path:
+    return root / key.split("_", 1)[-1][:2] / f"{key}{suffix}"
+
+
+def save_npy(path: Path, array: np.ndarray) -> None:
+    def write(tmp: str) -> None:
+        with open(tmp, "wb") as handle:
+            np.save(handle, array)
+
+    atomic_write(path, write)
+
+
+def fp_cache_config() -> dict:
+    return {
+        "rdkit_plus": RXN["rdkit_plus"],
+        "drfp": RXN["drfp"],
+        "standardize": RXN["standardize"],
+        "dtype": "float32",
+    }
+
+
+def protein_cache_config(smoke: bool) -> dict:
+    cfg = {
+        k: PROT[k]
+        for k in (
+            "model",
+            "revision",
+            "dim",
+            "pooling",
+            "chunk_length",
+            "tokenizer",
+            "dtype",
+            "batch_size",
+        )
+    }
+    return {**cfg, "smoke_random_vectors": smoke}
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Reaction fingerprints (original Horizyn classes)
+# ---------------------------------------------------------------------------------------------------------
+def make_fingerprint_datasets(reaction_dataset):
+    from horizyn.datasets.fingerprints import DRFPFingerprintDataset, RDKitPlusFingerprintDataset
+
+    rdkit = RDKitPlusFingerprintDataset(
+        reaction_dataset=reaction_dataset,
+        standardize=RXN["standardize"]["enabled"],
+        **RXN["rdkit_plus"],
+        **STD,
+    )
+    drfp = DRFPFingerprintDataset(
+        reaction_dataset=reaction_dataset,
+        standardize=RXN["standardize"]["enabled"],
+        **RXN["drfp"],
+        **STD,
+    )
+    return rdkit, drfp
+
+
+def fingerprint_chunk(smiles_list: list[str]) -> list[tuple[str, np.ndarray | None]]:
+    """Fingerprints of the forward and reverse direction of each reaction. None marks a reaction that fails."""
+    from horizyn.datasets.base import BaseDataset
+
+    keys, data = [], []
+    for smiles in smiles_list:
+        rid = reaction_id_for_smiles(smiles)
+        left, right = smiles.split(">>")
+        keys += [f"{rid}_f", f"{rid}_r"]
+        data += [{"reaction_smiles": smiles}, {"reaction_smiles": f"{right}>>{left}"}]
+    rdkit, drfp = make_fingerprint_datasets(BaseDataset(keys=keys, array_data=data))
+    out = []
+    for smiles in smiles_list:
+        rid = reaction_id_for_smiles(smiles)
+        try:
+            fps = [torch.cat([rdkit[f"{rid}_{d}"], drfp[f"{rid}_{d}"]]).numpy() for d in "fr"]
+            out.append((rid, np.stack(fps).astype(np.float32)))
+        except MemoryError:  # a failure of the machine, not of this reaction
+            raise
+        except Exception as exc:  # the original featurizer cannot process this reaction
+            print(f"[emulator_bench] dropping {rid}: {exc}", flush=True)
+            out.append((rid, None))
+    return out
+
+
+def read_fingerprint_index(root: Path) -> tuple[dict[str, tuple[str, int]], set[str]]:
+    """Map each cached reaction id to (shard name, row). The second value holds the ids the featurizer cannot process."""
+    index, bad = {}, set()
+    for meta in sorted(root.glob("shard_*.json")):
+        info = read_json(meta)
+        shard = meta.stem
+        index.update({rid: (shard, row) for row, rid in enumerate(info["ids"])})
+        bad.update(info["bad"])
+    return index, bad
+
+
+def write_fingerprint_shard(
+    root: Path, ids: list[str], fps: list[np.ndarray], bad: list[str]
+) -> None:
+    """Write one shard: a float32 array [reactions, 2 directions, 2048] and its id list. The id file marks the shard as complete."""
+    shard = f"shard_{uuid.uuid4().hex}"  # unique, so parallel processes never write the same shard
+    save_npy(
+        root / f"{shard}.npy",
+        np.stack(fps) if fps else np.empty((0, 2, 2 * FP_DIM), np.float32),
+    )
+    write_json(root / f"{shard}.json", {"ids": ids, "bad": bad})
+
+
+def fill_fingerprint_cache(root: Path, smiles_list: list[str], num_workers: int) -> None:
+    index, bad = read_fingerprint_index(root)
+    ids = {s: reaction_id_for_smiles(s) for s in smiles_list}
+    missing = [s for s in smiles_list if ids[s] not in index and ids[s] not in bad]
+    chunks = [missing[i : i + 256] for i in range(0, len(missing), 256)]
+    good_ids, good_fps, bad_ids = [], [], []
+    with mp.get_context("fork").Pool(num_workers) as pool:
+        for result in tqdm(
+            pool.imap_unordered(fingerprint_chunk, chunks),
+            total=len(chunks),
+            desc="reaction fingerprints",
+        ):
+            for rid, fps in result:
+                if fps is None:
+                    bad_ids.append(rid)
+                else:
+                    good_ids.append(rid)
+                    good_fps.append(fps)
+            if len(good_ids) >= SHARD_ROWS:
+                write_fingerprint_shard(root, good_ids, good_fps, bad_ids)
+                good_ids, good_fps, bad_ids = [], [], []
+    if good_ids or bad_ids:
+        write_fingerprint_shard(root, good_ids, good_fps, bad_ids)
+
+
+def load_fingerprints(root: Path, reaction_ids: list[str]) -> np.ndarray:
+    """Gather the fingerprints [reactions, 2, 2048] of the given ids from the memory-mapped shards."""
+    index, _ = read_fingerprint_index(root)
+    out = np.empty((len(reaction_ids), 2, 2 * FP_DIM), np.float32)
+    by_shard: dict[str, tuple[list[int], list[int]]] = {}
+    for position, rid in enumerate(reaction_ids):
+        shard, row = index[rid]
+        positions, rows = by_shard.setdefault(shard, ([], []))
+        positions.append(position)
+        rows.append(row)
+    for shard, (positions, rows) in by_shard.items():
+        out[positions] = np.load(root / f"{shard}.npy", mmap_mode="r")[rows]
+    return out
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Protein vectors
+# ---------------------------------------------------------------------------------------------------------
+def smoke_vector(sequence: str) -> np.ndarray:
+    seed = int(sha256_text(sequence)[:8], 16)
+    vec = np.random.default_rng(seed).standard_normal(PROT["dim"]).astype(np.float32)
+    return vec / np.linalg.norm(vec)
+
+
+def embed_with_prott5(missing: pd.DataFrame, root: Path, device: str) -> None:
+    from transformers import T5EncoderModel, T5Tokenizer
+
+    device = (
+        "cuda"
+        if device == "auto" and torch.cuda.is_available()
+        else ("cpu" if device == "auto" else device)
+    )
+    tokenizer = T5Tokenizer.from_pretrained(
+        PROT["model"], revision=PROT["revision"], do_lower_case=False
+    )
+    model = (
+        T5EncoderModel.from_pretrained(
+            PROT["model"],
+            revision=PROT["revision"],
+            use_safetensors=True,
+            dtype=torch.float16 if device.startswith("cuda") else torch.float32,
+        )
+        .to(device)
+        .eval()
+    )
+    size = PROT["chunk_length"]
+    chunks = [
+        (r.protein_id, r.sequence[i : i + size])
+        for r in missing.itertuples()
+        for i in range(0, len(r.sequence), size)
+    ]
+    chunk_counts = Counter(pid for pid, _ in chunks)
+    sums: dict[str, np.ndarray] = {}
+    seen: Counter = Counter()
+    for start in tqdm(range(0, len(chunks), PROT["batch_size"]), desc="ProtT5 embeddings"):
+        batch = chunks[start : start + PROT["batch_size"]]
+        text = [" ".join(seq.translate(str.maketrans("UZOB", "XXXX"))) for _, seq in batch]
+        tokens = {
+            k: v.to(device)
+            for k, v in tokenizer(
+                text, add_special_tokens=True, padding=True, return_tensors="pt"
+            ).items()
+        }
+        with torch.no_grad():
+            hidden = model(**tokens).last_hidden_state.float().cpu()
+        for i, (pid, seq) in enumerate(batch):
+            sums[pid] = sums.get(pid, 0) + hidden[i, : len(seq)].mean(dim=0).numpy()
+            seen[pid] += 1
+            if seen[pid] == chunk_counts[pid]:
+                vec = (sums.pop(pid) / chunk_counts[pid]).astype(np.float32)
+                save_npy(item_path(root, pid, ".npy"), vec)
+
+
+def fill_protein_cache(
+    root: Path, proteins: pd.DataFrame, source: str, device: str, shard: tuple[int, int] = (0, 1)
+) -> None:
+    missing = proteins[
+        [not item_path(root, pid, ".npy").exists() for pid in proteins["protein_id"]]
+    ]
+    missing = missing.iloc[shard[0] :: shard[1]]
+    print(
+        f"[emulator_bench] proteins: {len(proteins)} needed, {len(missing)} to embed", flush=True
+    )
+    if missing.empty:
+        return
+    if source == "deterministic":
+        for r in missing.itertuples():
+            save_npy(item_path(root, r.protein_id, ".npy"), smoke_vector(r.sequence))
+    else:
+        embed_with_prott5(missing, root, device)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# One split
+# ---------------------------------------------------------------------------------------------------------
+def unique_proteins(records: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    proteins = pd.concat(
+        [df[["protein_id", "sequence"]] for df in records.values()]
+    ).drop_duplicates("protein_id")
     return proteins.sort_values("protein_id").reset_index(drop=True)
 
 
-def _save_vector(path: Path, vector: np.ndarray) -> None:
-    ensure_dir(path.parent)
-    np.save(path, vector.astype(np.float32))
-
-
-def _load_vector(path: Path, expected_dim: int) -> np.ndarray:
-    vector = np.load(path).astype(np.float32)
-    if vector.shape != (expected_dim,):
-        raise ValueError(f"{path} has shape {vector.shape}; expected {(expected_dim,)}")
-    return vector
-
-
-def _prepare_prott5_sequences(sequences: list[str]) -> list[str]:
-    prepared = []
-    for sequence in sequences:
-        normalized = sequence.replace("U", "X").replace("Z", "X").replace("O", "X").replace("B", "X")
-        prepared.append(" ".join(normalized))
-    return prepared
-
-
-def embed_missing_with_prott5(
-    missing: pd.DataFrame,
+def prepare_split(
+    split: SplitDir,
     *,
-    cache_root: Path,
-    model_name: str,
-    model_revision: str | None,
-    device: str,
-    embedding_dim: int,
-    batch_size: int,
-) -> int:
-    try:
-        from transformers import T5EncoderModel, T5Tokenizer
-    except ImportError as exc:
-        raise ImportError(
-            "ProtT5 embedding generation requires transformers and sentencepiece. "
-            "Install the emulator optional dependencies or use --embedding-source cache-only "
-            "with a prepopulated cache."
-        ) from exc
+    out_root: Path,
+    limit_per_split: int | None = None,
+    embedding_source: str = "prott5",
+    device: str = "auto",
+    num_workers: int = 8,
+    embed_shard: tuple[int, int] | None = None,
+) -> dict | None:
+    """Write <split_dir>/data/ for one split. Reactions the original featurizer cannot process are dropped and counted.
 
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    revision_kwargs = {"revision": model_revision} if model_revision else {}
-    tokenizer = T5Tokenizer.from_pretrained(
-        model_name,
-        do_lower_case=False,
-        **revision_kwargs,
+    With embed_shard=(k, n) it only embeds every n-th missing protein, starting at k, and writes nothing else.
+    """
+    data_dir = split_dir_of(out_root, split.group, split.name) / "data"
+    fp_root = cache_dir(out_root, FP_CACHE, fp_cache_config())
+    smoke = embedding_source == "deterministic"
+    protein_root = cache_dir(
+        out_root, SMOKE_CACHE if smoke else PROTEIN_CACHE, protein_cache_config(smoke)
     )
-    model_kwargs = {
-        **revision_kwargs,
-        "use_safetensors": True,
-    }
-    if device.startswith("cuda"):
-        model_kwargs["torch_dtype"] = torch.float16
-    try:
-        model = T5EncoderModel.from_pretrained(model_name, **model_kwargs).to(device)
-    except Exception as exc:
-        revision_text = f" revision {model_revision!r}" if model_revision else ""
-        raise RuntimeError(
-            f"Could not load {model_name}{revision_text} with safetensors. "
-            "The current horizon environment has torch<2.6, so recent "
-            "transformers releases refuse to load pytorch_model.bin files. "
-            "Use a safetensors revision/cache, prepopulate the protein cache and "
-            "run with --embedding-source cache-only, or upgrade torch in the "
-            "horizon environment to >=2.6."
-        ) from exc
-    model.eval()
 
-    written = 0
-    records = missing.to_dict("records")
-    for start in progress(range(0, len(records), batch_size), desc="ProtT5 embeddings"):
-        batch = records[start : start + batch_size]
-        sequences = [record["sequence"] for record in batch]
-        tokenized = tokenizer(
-            _prepare_prott5_sequences(sequences),
-            add_special_tokens=True,
-            padding=True,
-            return_tensors="pt",
+    records, stats = {}, {}
+    for name in SPLIT_NAMES:
+        records[name], stats[name] = load_records(split.path / f"{name}.parquet", limit_per_split)
+    if embed_shard:
+        fill_protein_cache(
+            protein_root, unique_proteins(records), embedding_source, device, embed_shard
         )
-        tokenized = {key: value.to(device) for key, value in tokenized.items()}
-        with torch.no_grad():
-            outputs = model(**tokenized)
-        hidden = outputs.last_hidden_state.detach().float().cpu()
-        for idx, record in enumerate(batch):
-            seq_len = len(record["sequence"])
-            vector = hidden[idx, :seq_len].mean(dim=0).numpy().astype(np.float32)
-            if vector.shape != (embedding_dim,):
-                raise ValueError(
-                    f"ProtT5 produced vector shape {vector.shape}; expected {(embedding_dim,)}"
-                )
-            _save_vector(protein_cache_path(cache_root, record["protein_id"]), vector)
-            written += 1
-    return written
+        return None
+    all_smiles = sorted(set().union(*(set(df["reaction_smiles"]) for df in records.values())))
+    fill_fingerprint_cache(fp_root, all_smiles, num_workers)
+    bad = read_fingerprint_index(fp_root)[1]
 
+    # The candidate pool holds every protein of the split, also those of dropped reactions.
+    all_records = dict(records)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    pd.concat(all_records.values())[["protein_id", "ec_number"]].drop_duplicates().to_csv(
+        data_dir / "pool_manifest.csv", index=False
+    )
 
-def populate_protein_cache(
-    proteins: pd.DataFrame,
-    *,
-    cache_root: Path,
-    embedding_source: str,
-    allow_deterministic_embeddings: bool,
-    embedding_dim: int,
-    protein_model_name: str,
-    protein_model_revision: str | None,
-    device: str,
-    sequence_batch_size: int,
-) -> dict:
-    cache_root = ensure_dir(cache_root)
-    missing_records = []
-    hits = 0
-    for row in progress(
-        proteins.itertuples(index=False),
-        total=len(proteins),
-        desc="protein cache scan",
-    ):
-        path = protein_cache_path(cache_root, row.protein_id)
-        if path.exists():
-            _load_vector(path, embedding_dim)
-            hits += 1
-            continue
-        missing_records.append(
-            {"protein_id": row.protein_id, "sequence": row.sequence}
+    for name, df in records.items():
+        keep = ~df["reaction_id"].isin(bad)
+        stats[name]["dropped_unfeaturizable_reactions"] = int(
+            df.loc[~keep, "reaction_id"].nunique()
         )
-
-    if missing_records and embedding_source == "cache-only":
-        raise FileNotFoundError(
-            f"{len(missing_records)} protein embeddings are missing from {cache_root}"
-        )
-
-    written = 0
-    if missing_records and embedding_source == "deterministic":
-        if not allow_deterministic_embeddings:
-            raise ValueError(
-                "Deterministic embeddings are for smoke tests only. "
-                "Pass --allow-deterministic-embeddings to acknowledge this."
+        stats[name]["dropped_unfeaturizable_pairs"] = int((~keep).sum())
+        # Evaluation scores these reactions as misses.
+        df[~keep].groupby(["reaction_id", "reaction_smiles"], as_index=False).agg(
+            ec_number=(
+                "ec_number",
+                lambda v: ";".join(sorted({e for x in v for e in x.split(";") if e})),
             )
-        for record in progress(missing_records, desc="deterministic embeddings"):
-            vector = deterministic_vector(record["sequence"], embedding_dim)
-            _save_vector(protein_cache_path(cache_root, record["protein_id"]), vector)
-            written += 1
-    elif missing_records and embedding_source == "prott5":
-        written = embed_missing_with_prott5(
-            pd.DataFrame(missing_records),
-            cache_root=cache_root,
-            model_name=protein_model_name,
-            model_revision=protein_model_revision,
-            device=device,
-            embedding_dim=embedding_dim,
-            batch_size=sequence_batch_size,
+        ).to_csv(data_dir / f"{name}_dropped.csv", index=False)
+        records[name] = df[keep].reset_index(drop=True)
+        if records[name].empty:
+            raise ValueError(f"{split.label}/{name} has no usable rows")
+        stats[name].update(
+            pairs=int(len(records[name])),
+            reactions=int(records[name]["reaction_id"].nunique()),
+            proteins=int(records[name]["protein_id"].nunique()),
+            pairs_with_full_ec=int(
+                records[name]["ec_number"].map(lambda v: bool(full_ec_labels(v))).sum()
+            ),
+        )
+        pairs = records[name][["reaction_id", "protein_id"]].copy()
+        pairs.insert(0, "pr_id", "pair_" + pairs.index.astype(str))
+        data_dir.mkdir(parents=True, exist_ok=True)
+        pairs.to_csv(data_dir / f"{name}_pairs.csv", index=False)
+        records[name][["reaction_id", "reaction_smiles"]].drop_duplicates().sort_values(
+            "reaction_id"
+        ).to_csv(data_dir / f"{name}_rxns.csv", index=False)
+        records[name].drop(columns="sequence").to_csv(
+            data_dir / f"{name}_manifest.csv", index=False
         )
 
-    return {
-        "cache_hits": int(hits),
-        "cache_misses": int(len(missing_records)),
-        "cache_written": int(written),
+    proteins = unique_proteins(all_records)
+    fill_protein_cache(protein_root, proteins, embedding_source, device)
+    vectors = np.stack(
+        [
+            np.load(item_path(protein_root, pid, ".npy"))
+            for pid in tqdm(proteins["protein_id"], desc="protein HDF5")
+        ]
+    )
+
+    def write_h5(tmp: str) -> None:
+        with h5py.File(tmp, "w") as handle:
+            handle.create_dataset(
+                "ids",
+                data=np.array(proteins["protein_id"], dtype=object),
+                dtype=h5py.string_dtype("utf-8"),
+            )
+            handle.create_dataset("vectors", data=vectors.astype(np.float32))
+
+    atomic_write(data_dir / "prots_t5.h5", write_h5)
+
+    rxn_ids = sorted(set().union(*(set(df["reaction_id"]) for df in records.values())))
+    id_to_smiles = {reaction_id_for_smiles(s): s for s in all_smiles}
+    fps = load_fingerprints(fp_root, rxn_ids)
+
+    def write_fps(tmp: str) -> None:
+        with open(tmp, "wb") as handle:
+            np.savez(
+                handle,
+                ids=np.array(rxn_ids),
+                fps=fps,
+                smiles=np.array([id_to_smiles[i] for i in rxn_ids]),
+            )
+
+    atomic_write(data_dir / "rxn_fps.npz", write_fps)
+    summary = {
+        "split": split.label,
+        "limit_per_split": limit_per_split,
         "embedding_source": embedding_source,
-        "embedding_dim": int(embedding_dim),
+        "stats": stats,
+        "unique_proteins": int(len(proteins)),
     }
-
-
-def write_hdf5_view(
-    proteins: pd.DataFrame,
-    *,
-    cache_root: Path,
-    output_path: Path,
-    embedding_dim: int,
-) -> None:
-    ensure_dir(output_path.parent)
-    ids = proteins["protein_id"].astype(str).tolist()
-    vectors = np.zeros((len(ids), embedding_dim), dtype=np.float32)
-    for idx, protein_id in enumerate(progress(ids, desc="materialize HDF5")):
-        vectors[idx] = _load_vector(protein_cache_path(cache_root, protein_id), embedding_dim)
-    with h5py.File(output_path, "w") as handle:
-        string_dtype = h5py.string_dtype(encoding="utf-8")
-        handle.create_dataset("ids", data=np.array(ids, dtype=object), dtype=string_dtype)
-        handle.create_dataset("vectors", data=vectors, compression="gzip")
-
-
-def prepare_and_cache_group(
-    group,
-    *,
-    dataset_root: str | Path,
-    runs_root: str | Path,
-    cache_root: str | Path,
-    label_policy: str,
-    max_sequence_length: int,
-    limit_per_split: int | None,
-    validate_fingerprints: bool,
-    embedding_source: str,
-    allow_deterministic_embeddings: bool,
-    embedding_dim: int,
-    protein_model_name: str,
-    protein_model_revision: str | None,
-    device: str,
-    sequence_batch_size: int,
-) -> dict:
-    cache_root = resolve_path(cache_root)
-    metadata = prepare_split_group(
-        group,
-        dataset_root=dataset_root,
-        runs_root=runs_root,
-        label_policy=label_policy,
-        max_sequence_length=max_sequence_length,
-        limit_per_split=limit_per_split,
-        validate_fingerprints=validate_fingerprints,
-    )
-    proteins = _load_protein_table(metadata)
-    cache_stats = populate_protein_cache(
-        proteins,
-        cache_root=cache_root,
-        embedding_source=embedding_source,
-        allow_deterministic_embeddings=allow_deterministic_embeddings,
-        embedding_dim=embedding_dim,
-        protein_model_name=protein_model_name,
-        protein_model_revision=protein_model_revision,
-        device=device,
-        sequence_batch_size=sequence_batch_size,
-    )
-
-    hdf5_path = Path(metadata["run_root"]) / "horizyn_data" / "prots_t5.h5"
-    write_hdf5_view(
-        proteins,
-        cache_root=cache_root,
-        output_path=hdf5_path,
-        embedding_dim=embedding_dim,
-    )
-    metadata["baseline_files"]["protein_embeds"] = str(hdf5_path)
-    metadata["cache"] = {
-        "cache_root": str(cache_root),
-        "protein_manifest": str(Path(metadata["run_root"]) / "manifests" / "proteins.csv"),
-        **cache_stats,
-    }
-    protein_manifest = proteins.loc[:, ["protein_id", "sequence_sha256"]].copy()
-    protein_manifest["cache_path"] = protein_manifest["protein_id"].map(
-        lambda protein_id: str(protein_cache_path(cache_root, protein_id))
-    )
-    protein_manifest.to_csv(metadata["cache"]["protein_manifest"], index=False)
-    write_json(metadata_path_for_split(group.name, runs_root), metadata)
-    return metadata
+    write_json(data_dir / "data_summary.json", summary)
+    return summary
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Cache Horizon protein features for EMULaToR")
-    parser.add_argument("--dataset-root", default=str(DEFAULT_DATASET_ROOT))
-    parser.add_argument("--split-group", action="append")
-    parser.add_argument("--runs-root", default=str(DEFAULT_RUNS_ROOT))
-    parser.add_argument("--cache-root", default=str(DEFAULT_CACHE_ROOT))
-    parser.add_argument("--label-policy", choices=["remove", "truncate", "keep"], default="remove")
-    parser.add_argument("--max-sequence-length", type=int, default=DEFAULT_MAX_SEQUENCE_LENGTH)
-    parser.add_argument("--limit-per-split", type=int, default=None)
-    parser.add_argument("--skip-fingerprint-validation", action="store_true")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset_root", default=str(DEFAULT_DATASET_ROOT))
+    parser.add_argument("--out_root", default=str(DEFAULT_OUT_ROOT))
     parser.add_argument(
-        "--embedding-source",
-        choices=["prott5", "cache-only", "deterministic"],
-        default="prott5",
+        "--splits",
+        nargs="+",
+        help="Split labels (group/name) or groups. Default: all default splits found on disk.",
     )
-    parser.add_argument("--allow-deterministic-embeddings", action="store_true")
-    parser.add_argument("--embedding-dim", type=int, default=1024)
-    parser.add_argument("--protein-model-name", default="Rostlab/prot_t5_xl_half_uniref50-enc")
     parser.add_argument(
-        "--protein-model-revision",
-        default="refs/pr/1",
-        help=(
-            "Model revision used for ProtT5. The default points at the "
-            "safetensors conversion PR because transformers refuses PyTorch "
-            "weight files with torch<2.6."
-        ),
+        "--limit_per_split",
+        type=int,
+        default=None,
+        help="Smoke test only: random rows per split file.",
+    )
+    parser.add_argument(
+        "--embedding_source",
+        choices=["prott5", "deterministic"],
+        default="prott5",
+        help="'deterministic' writes random vectors to a separate smoke cache. Smoke test only.",
     )
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--sequence-batch-size", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument(
+        "--embed_shard",
+        help="K/N: only embed every N-th missing protein, starting at K, then stop.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    groups = select_split_groups(args.dataset_root, args.split_group)
-    for group in groups:
-        metadata = prepare_and_cache_group(
-            group,
-            dataset_root=args.dataset_root,
-            runs_root=args.runs_root,
-            cache_root=args.cache_root,
-            label_policy=args.label_policy,
-            max_sequence_length=args.max_sequence_length,
+    splits, skipped = discover_splits(args.dataset_root, args.splits)
+    for line in skipped:
+        print(f"[emulator_bench] skipped {line}", flush=True)
+    shard = tuple(map(int, args.embed_shard.split("/"))) if args.embed_shard else None
+    for split in splits:
+        summary = prepare_split(
+            split,
+            out_root=Path(args.out_root),
             limit_per_split=args.limit_per_split,
-            validate_fingerprints=not args.skip_fingerprint_validation,
             embedding_source=args.embedding_source,
-            allow_deterministic_embeddings=args.allow_deterministic_embeddings,
-            embedding_dim=args.embedding_dim,
-            protein_model_name=args.protein_model_name,
-            protein_model_revision=args.protein_model_revision,
             device=args.device,
-            sequence_batch_size=args.sequence_batch_size,
+            num_workers=args.num_workers,
+            embed_shard=shard,
         )
-        print(
-            f"[emulator_bench] cached {group.name}: "
-            f"{metadata['baseline_files']['protein_embeds']} "
-            f"(hits={metadata['cache']['cache_hits']}, "
-            f"misses={metadata['cache']['cache_misses']}, "
-            f"written={metadata['cache']['cache_written']})",
-            flush=True,
-        )
+        if shard:
+            continue
+        print(f"[emulator_bench] prepared {split.label}: {summary['stats']}", flush=True)
 
 
 if __name__ == "__main__":

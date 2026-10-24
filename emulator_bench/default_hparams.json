@@ -1,0 +1,59 @@
+{
+  "_note": "Original Horizyn settings. Code wins over the paper. Source key: sota = configs/sota.yaml, train.py, horizyn/*.py; paper = horizyn.pdf (PNAS 2026), pages 9-10.",
+  "task": "enzyme_retrieval",
+  "dataset_folder": "enzyme_retrieval_dataset",
+  "seeds": [666, 777, 888],
+  "split_folders": [
+    "random_splits_grouped_rxn_key",
+    "uniprot_time_splits",
+    "enzyme_sequence_splits",
+    "enzyme_structure_splits",
+    "reaction_drfp_tanimoto_splits"
+  ],
+  "model": {
+    "query_encoder_dims": [2048, 4096, 4096, 512],
+    "target_encoder_dims": [1024, 4096, 4096, 512],
+    "embedding_dim": 512,
+    "source": "sota: configs/sota.yaml:50-56 (paper text: two-layer MLP, 4096 hidden, ReLU, L2-normalised output)"
+  },
+  "training": {
+    "max_epochs": 100,
+    "learning_rate": 0.0001,
+    "weight_decay": 0.01,
+    "optimizer": "AdamW, default betas (0.9, 0.999), no scheduler",
+    "loss": {"name": "FullBatchMLNCELoss", "beta": 10.0, "learn_beta": false},
+    "train_batch_size": 16384,
+    "retrieval_batch_size": 128,
+    "check_val_every_n_epoch": 10,
+    "save_every_n_epochs": 10,
+    "precision": "32-true",
+    "early_stopping": "none",
+    "metrics_top_k": [1, 10, 100, 1000],
+    "source": "sota: configs/sota.yaml, horizyn/lightning_module.py:499-511, train.py:171-181. The paper states lr 5e-5 and padding of the last batch; the code uses lr 1e-4 and does not pad. Code is used."
+  },
+  "reaction_features": {
+    "rdkit_plus": {"vec_dim": 1024, "mol_fp_type": "morgan", "rxn_fp_type": "struct", "use_chirality": true},
+    "drfp": {"vec_dim": 1024, "radius": 3, "rings": true},
+    "standardize": {"enabled": true, "hypervalent": true, "remove_hs": true, "kekulize": false, "uncharge": true, "metals": true},
+    "direction_augmentation": "every pair is used in both directions (_f and _r)",
+    "source": "sota: horizyn/data_module.py:333-376, configs/sota.yaml:34-44; paper p.8-9"
+  },
+  "protein_features": {
+    "model": "Rostlab/prot_t5_xl_half_uniref50-enc",
+    "revision": "refs/pr/1",
+    "dim": 1024,
+    "pooling": "mean over residues of the last hidden state (no special tokens)",
+    "chunk_length": 5000,
+    "chunk_combination": "mean of chunk vectors",
+    "tokenizer": "T5Tokenizer, do_lower_case=False, space separated residues, U Z O B mapped to X",
+    "dtype": "float16 on GPU, float32 on CPU",
+    "batch_size": 1,
+    "source": "paper p.9 (Enzyme representations). The released code has no embedding script, so pooling, tokenizer and precision follow the standard ProtT5 recipe. See REPORT open issues."
+  },
+  "evaluation": {
+    "native": "scripts/evaluate.py: Top-1/10/100/1000 hit rate, R-precision, average precision. Screening set = all proteins of the split.",
+    "ec_metrics": "EC accuracy at levels 4..1 for k in 1,3,5,10,20,30,40,50. Each reaction (forward and reverse score, max) ranks the EC numbers of train proteins by their best protein score. Only EC numbers with all four levels count. The paper table (camera_ready.tex, tab:function_detailed_combined) uses k=1.",
+    "checkpoint": "last epoch (README of the original: epoch=99 checkpoint)",
+    "ec_k_values": [1, 3, 5, 10, 20, 30, 40, 50]
+  }
+}

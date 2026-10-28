@@ -55,3 +55,28 @@ The run is evaluated at the last epoch, as in the original README. Each reaction
 of all proteins of the split (train, val and test, also those of dropped reactions; `data/pool_manifest.csv`) by their best protein score. Forward and reverse scores combine with max.
 The paper number is the EC accuracy at k=1 per level (L1 to L4). The native Horizyn metrics
 (top-k, R-precision, average precision) are saved in `results_test.json`.
+
+## Verify equivalence
+
+```
+emulator_bench/verify_equivalence.sh          # CPU, a few minutes, no data or weights needed
+emulator_bench/verify_equivalence.sh --gpu    # also the bf16 test, needs a CUDA device
+emulator_bench/verify_equivalence.sh --negative-control  # GPU test must FAIL, needs a CUDA device
+```
+
+Run it in the `horizyn_venv` environment (set `PYTHON` to its interpreter). The script fails if any test is skipped.
+It uses the synthetic split in `emulator_bench/tests/fixtures/split` (made by `make_fixture.py`).
+ProtT5 vectors are deterministic stand-ins, because the original code has no embedding script.
+
+- Fingerprints, pair batches, one training step and the EC ranking are compared with the original code.
+  Float64 tensors make these bit-equal or equal to rounding noise (atol 1e-12 for the loss, 1e-10 for weights).
+- `test_end_to_end.py` trains 3 epochs with the original `train.py` and with `emulator_bench.fit`, same seed and
+  4 threads. The weights and the logged metrics must be bit-equal.
+- `test_gpu_precision.py` trains 4 epochs in fp32 and in bf16 (the `--amp` setting), both through `emulator_bench.fit`
+  (on-GPU batch gather, `deterministic=True` as in the original `train.py`). A noise control reruns the bf16
+  path with initial weights perturbed by 2**-8 (relative, one bf16 rounding). The bf16 gap to fp32, per step loss and final validation
+  loss, must stay within 10 times the gap the perturbation causes. Step 0 is judged like every other step: its gap must be at most 10 times its floor. The test prints
+  the measured ratio (the script runs it with `-s`).
+  `--negative-control` multiplies the initial weights of the bf16 run by 1.05. The test must then fail; the script exits 0 only if it does.
+
+Not exact: bf16 training (rounding differs from fp32), and CPU results with a different thread count.

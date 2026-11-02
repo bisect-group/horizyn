@@ -11,6 +11,7 @@ from .utils import HPARAMS, protein_id_for_sequence, reaction_id_for_smiles
 
 REQUIRED_COLUMNS = {"rxn_smiles", "ec_number", "sequence"}
 SPLIT_NAMES = ("train", "val", "test")
+PROTEIN_FOLDER = "with_protein_information"  # dataset folder level that is not part of the split key
 
 
 @dataclass(frozen=True)
@@ -37,7 +38,7 @@ def discover_splits(
         path = train_file.parent
         if not all((path / f"{split}.parquet").exists() for split in SPLIT_NAMES):
             continue
-        rel = path.relative_to(root)
+        rel = Path(*(p for p in path.relative_to(root).parts if p != PROTEIN_FOLDER))
         if any(part.startswith("backup") for part in rel.parts):
             continue
         threshold = rel.name.startswith("threshold_")
@@ -53,6 +54,8 @@ def discover_splits(
         if not REQUIRED_COLUMNS <= set(pq.read_schema(train_file).names):
             skipped.append(f"{split.label}: no sequence column")
             continue
+        if any(s.label == split.label for s in found):
+            raise ValueError(f"Two folders map to {split.label}: {path}")
         found.append(split)
     return found, skipped
 

@@ -67,8 +67,8 @@ def test_discover_splits_skips_backups_and_takes_drfp(tmp_path):
     write_split(tmp_path, f"{base}/enzyme_structure_splits/backup_2026/threshold_0.7", "all")
     labels = {s.label for s in dataset_adapter.discover_splits(tmp_path)[0]}
     assert labels == {
-        f"{base}/random_splits_grouped_rxn_key/all",
-        f"{base}/reaction_drfp_tanimoto_splits/threshold_0.425",
+        "random_splits_grouped_rxn_key/all",
+        "reaction_drfp_tanimoto_splits/threshold_0.425",
     }
     found = dataset_adapter.discover_splits(tmp_path, ["reaction_drfp_tanimoto_splits"])[0]
     assert [s.name for s in found] == ["threshold_0.425"]

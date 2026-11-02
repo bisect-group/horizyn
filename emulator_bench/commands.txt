@@ -20,12 +20,12 @@ $PY -m emulator_bench.run_benchmarks --gpus 2 --features_only \
   --splits random_splits_grouped_rxn_key uniprot_time_splits reaction_drfp_tanimoto_splits
 
 # 4. One split and one seed
-$PY -m emulator_bench.run_benchmarks --gpus 0 --splits with_protein_information/uniprot_time_splits/all --seeds 666
+$PY -m emulator_bench.run_benchmarks --gpus 0 --splits uniprot_time_splits/all --seeds 666
 
 # 5. Summary CSVs from the saved predictions: summary_by_seed.csv, summary.csv, dropped_reactions.csv
 $PY -m emulator_bench.aggregate_results
 
 # Smoke test on CPU (tiny data, random protein vectors, 3 epochs). Use any scratch folder as --out_root.
 CUDA_VISIBLE_DEVICES="" $PY -m emulator_bench.run_benchmarks --out_root /path/to/scratch/smoke \
-  --splits with_protein_information/uniprot_time_splits --seeds 666 --limit_per_split 64 \
+  --splits uniprot_time_splits --seeds 666 --limit_per_split 64 \
   --embedding_source deterministic --epochs 3 --eval_splits val test

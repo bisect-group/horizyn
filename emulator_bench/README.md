@@ -7,8 +7,8 @@ Defaults and their sources are in `default_hparams.json`. See `REPORT.md` for th
 ## Data
 
 Horizyn needs reaction-protein pairs. Only split folders whose parquet files hold a `sequence`
-column work. Today this means the folders under `with_protein_information/`. The wrapper finds the
-folders on disk (`train.parquet`, `val.parquet`, `test.parquet`). It never re-splits.
+column work. Today this means the folders under `with_protein_information/`; that level is not part of the
+split key or output path. The wrapper finds the folders on disk (`train.parquet`, `val.parquet`, `test.parquet`). It never re-splits.
 
 - `rxn_smiles` is the reaction. `sequence` is the protein. Repeated pairs become one pair.
 - All pairs train and validate, also those with unknown or partial EC numbers.

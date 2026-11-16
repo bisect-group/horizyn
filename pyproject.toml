@@ -23,6 +23,14 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
+[project.optional-dependencies]
+emulator = [
+    "pandas>=2.0.0",
+    "pyarrow>=14.0.0",
+    "transformers>=4.39.0",
+    "sentencepiece>=0.1.99",
+]
+
 # Specific configuration for PyTorch source (CUDA 12.1, x86_64)
 [[tool.uv.index]]
 name = "torch-cuda"
@@ -99,4 +107,3 @@ exclude_lines = [
     "class .*\\bProtocol\\):",
     "@(abc\\.)?abstractmethod",
 ]
-

@@ -1,0 +1,93 @@
+# Horizon (Horizyn) EMULaToR wrapper
+
+This wrapper trains Horizyn with its original settings (`configs/sota.yaml`, 100 epochs) on the
+EMULaToR enzyme retrieval splits. It runs seeds 666, 777 and 888 on every split. It does no tuning.
+Defaults and their sources are in `default_hparams.json`. See `REPORT.md` for the audit.
+
+## Data
+
+Horizyn needs reaction-protein pairs. Only split folders whose parquet files hold a `sequence`
+column work. Today this means the folders under `with_protein_information/`; that level is not part of the
+split key or output path. The wrapper finds the folders on disk (`train.parquet`, `val.parquet`, `test.parquet`). It never re-splits.
+
+- `rxn_smiles` is the reaction. `sequence` is the protein. Repeated pairs become one pair.
+- All pairs train and validate, also those with unknown or partial EC numbers.
+- `ec_number` is used only in evaluation. Only four-level EC numbers count.
+- Sequences are not cut. ProtT5 gets chunks of 5000 residues. The chunk vectors are averaged.
+- Reactions that the Horizyn featurizer cannot process are dropped and counted
+  (`dropped_reactions.csv`). Dropped test reactions with a full EC count as misses in the EC accuracy
+  (`reactions_missed_unfeaturizable` in `results_test.json`). The native metrics skip them. Rows without a sequence are counted as invalid rows.
+
+## Output
+
+Everything goes to `<EMULaToR>/outputs/baselines/Horizon` (`--out_root`). The dataset tree is read only.
+
+- `embeddings/prott5_v1/` (one `.npy` per protein), `embeddings/rxnfp_v2/` (three shards of reaction fingerprints, read with mmap): shared caches
+- `enzyme_retrieval/<split_group>/<split_name>/data/`: pair files, protein vectors, fingerprints
+- `enzyme_retrieval/<split_group>/<split_name>/seed_<seed>/`: `bestmodel.pth`, `lastmodel.pth`,
+  `checkpoint_last.pt`, `config.yaml`, `logs/`, `predictions_test.csv`, `results_test.json`
+- `enzyme_retrieval/{summary_by_seed,summary,dropped_reactions}.csv`
+
+## Run
+
+Run from this repository root (`baselines/Horizon`). See `emulator_bench/commands.txt` or use `run.sh` (Reproduce).
+
+```
+python -m emulator_bench.run_benchmarks --gpus 0 1 2 --runs_per_gpu 2 [--amp]
+python -m emulator_bench.aggregate_results
+```
+
+- `--amp` uses bf16 autocast (fp16 on older GPUs). Without it the run uses fp32, as the original.
+- A finished run has `results_test.json` and is skipped. An interrupted run resumes from `checkpoint_last.pt`.
+  Lightning does not restore the global RNG on resume, so a resumed run is valid but not bit-equal to an uninterrupted one.
+  A run that stops before the last epoch (for example Ctrl+C) fails and is not exported as finished.
+- Without `--gpus`, runs use the CPU (`CUDA_VISIBLE_DEVICES` is empty for every child process).
+- The environment needs `torch`, `lightning`, `rdkit`, `drfp`, `h5py`, `transformers`, `sentencepiece`,
+  `pandas`, `pyarrow`. Our runs used a venv on top of the `mldb` env with h5py added.
+- ProtT5 weights: `Rostlab/prot_t5_xl_half_uniref50-enc` (about 2.4 GB) must be in the Hugging Face cache.
+- With more than one GPU, each GPU embeds one shard of the proteins. Each protein is still embedded alone.
+- Batches are built in the main process with the vectors on the GPU (`num_workers` 0). A run needs about 6.5 GB of GPU memory.
+  Two runs per GPU give about 1.35 times the throughput of one.
+
+## Reproduce
+
+`emulator_bench/run.sh [--dry-run] [cache|train|rescore|aggregate|all]` runs the paper chain: feature cache, train and test on every retrieval split for the three seeds with `--amp` (bf16; `AMP=0` for fp32), the B-EC rescore, and the aggregation. We used the `horizyn_venv` env (a venv on top of `mldb` with h5py) as `PY`.
+
+The paper scores retrieval without preliminary ECs (labels that are not four numeric levels). `rescore` reads `predictions_test.csv` and writes `ec_level_accuracy_no_b.json` per run. Those ECs leave the true ECs and the ranked lists. A reaction with no true EC left is not a query. `aggregate` writes `summary.csv` (all ECs) and `summary_no_b.csv` (the paper rows).
+Environment variables: `PY` (default `python`), `GPUS` (space-separated ids, default `0`), `SEEDS` (default `666 777 888`), `RUNS_PER_GPU`, `DATA_ROOT`, `OUT_ROOT`, `EMULATOR_ROOT` and `DRY_RUN=1`. `--dry-run` prints the commands. A step name runs one step.
+
+```bash
+baselines/Horizon/emulator_bench/run.sh
+```
+
+## Evaluation
+
+The run is evaluated at the last epoch, as in the original README. Each reaction ranks the EC numbers
+of all proteins of the split (train, val and test, also those of dropped reactions; `data/pool_manifest.csv`) by their best protein score. Forward and reverse scores combine with max.
+The paper number is the EC accuracy at k=1 per level (L1 to L4). The native Horizyn metrics
+(top-k, R-precision, average precision) are saved in `results_test.json`.
+
+## Verify equivalence
+
+```
+emulator_bench/verify_equivalence.sh          # CPU, a few minutes, no data or weights needed
+emulator_bench/verify_equivalence.sh --gpu    # also the bf16 test, needs a CUDA device
+emulator_bench/verify_equivalence.sh --negative-control  # GPU test must FAIL, needs a CUDA device
+```
+
+Run it in the `horizyn_venv` environment (set `PYTHON` to its interpreter). The script fails if any test is skipped.
+It uses the synthetic split in `emulator_bench/tests/fixtures/split` (made by `make_fixture.py`).
+ProtT5 vectors are deterministic stand-ins, because the original code has no embedding script.
+
+- Fingerprints, pair batches, one training step and the EC ranking are compared with the original code.
+  Float64 tensors make these bit-equal or equal to rounding noise (atol 1e-12 for the loss, 1e-10 for weights).
+- `test_end_to_end.py` trains 3 epochs with the original `train.py` and with `emulator_bench.fit`, same seed and
+  4 threads. The weights and the logged metrics must be bit-equal.
+- `test_gpu_precision.py` trains 4 epochs in fp32 and in bf16 (the `--amp` setting), both through `emulator_bench.fit`
+  (on-GPU batch gather, `deterministic=True` as in the original `train.py`). A noise control reruns the bf16
+  path with initial weights perturbed by 2**-8 (relative, one bf16 rounding). The bf16 gap to fp32, per step loss and final validation
+  loss, must stay within 10 times the gap the perturbation causes. Step 0 is judged like every other step: its gap must be at most 10 times its floor. The test prints
+  the measured ratio (the script runs it with `-s`).
+  `--negative-control` multiplies the initial weights of the bf16 run by 1.05. The test must then fail; the script exits 0 only if it does.
+
+Not exact: bf16 training (rounding differs from fp32), and CPU results with a different thread count.

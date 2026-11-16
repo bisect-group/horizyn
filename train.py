@@ -103,6 +103,7 @@ def main():
     print(f"Target Encoder: {config.model.target_encoder_dims}")
     print(f"Embedding Dim: {config.model.embedding_dim}")
     print(f"Loss: {config.training.loss.name} (beta={config.training.loss.beta})")
+    print(f"Precision: {config.training.get('precision', '32-true')}")
     print(f"Log Dir: {config.logging.log_dir}")
     print(f"Checkpoint Dir: {config.logging.checkpoint_dir}")
     print("=" * 80 + "\n")
@@ -191,6 +192,7 @@ def main():
         log_every_n_steps=config.logging.get("log_every_n_steps", 1),
         check_val_every_n_epoch=config.training.get("check_val_every_n_epoch", 10),
         enable_progress_bar=config.training.get("enable_progress_bar", True),
+        precision=config.training.get("precision", "32-true"),
         deterministic=True,  # For reproducibility
         # Single GPU training (DDP not supported in simplified version)
         devices=1 if torch.cuda.is_available() else "auto",
